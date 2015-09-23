@@ -24,6 +24,7 @@
          set_object_acl/3, set_object_acl/4,
          make_link/3, make_link/4,
          make_get_url/3, make_get_url/4,
+         make_put_url/4,
          start_multipart/2, start_multipart/5,
          upload_part/5, upload_part/7,
          complete_multipart/4, complete_multipart/6,
@@ -207,14 +208,14 @@ delete_objects_batch(Bucket, KeyList) ->
 -spec delete_objects_batch(string(), list(), aws_config()) -> no_return().
 delete_objects_batch(Bucket, KeyList, Config) ->
     Data = lists:map(fun(Item) ->
-            lists:concat(["<Object><Key>", Item, "</Key></Object>"]) end, 
+            lists:concat(["<Object><Key>", Item, "</Key></Object>"]) end,
                 KeyList),
     Payload = unicode:characters_to_list(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Delete>" ++ Data ++ "</Delete>", 
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Delete>" ++ Data ++ "</Delete>",
                 utf8),
 
     Len = integer_to_list(string:len(Payload)),
-    Url = lists:flatten([Config#aws_config.s3_scheme, 
+    Url = lists:flatten([Config#aws_config.s3_scheme,
                 Bucket, ".", Config#aws_config.s3_host, port_spec(Config), "/?delete"]),
     Host = Bucket ++ "." ++ Config#aws_config.s3_host,
     ContentMD5 = base64:encode(erlcloud_util:md5(Payload)),
@@ -226,7 +227,7 @@ delete_objects_batch(Bucket, KeyList, Config) ->
     erlcloud_aws:http_headers_body(Result).
 
 % returns paths list from AWS S3 root directory, used as input to delete_objects_batch
-% example : 
+% example :
 %    25> rp(erlcloud_s3:explore_dirstructure("xmppfiledev", ["sailfish/deleteme"], [])).
 %    ["sailfish/deleteme/deep/deep1/deep4/ZZZ_1.txt",
 %     "sailfish/deleteme/deep/deep1/deep4/ZZZ_0.txt",
@@ -236,14 +237,14 @@ delete_objects_batch(Bucket, KeyList, Config) ->
 %
 -spec explore_dirstructure(string(), list(), list()) -> list().
 
-explore_dirstructure(_, [], Result) -> 
+explore_dirstructure(_, [], Result) ->
                                     lists:append(Result);
 explore_dirstructure(Bucketname, [Branch|Tail], Accum) ->
     ProcessContent = fun(Data)->
             Content = proplists:get_value(contents, Data),
             lists:foldl(fun(I,Acc)-> R = proplists:get_value(key, I), [R|Acc] end, [], Content)
             end,
-    
+
     Data = erlcloud_s3:list_objects(Bucketname,[{prefix, Branch}, {delimiter, "/"}]),
     case proplists:get_value(common_prefixes, Data) of
         [] -> % it has reached end of the branch
@@ -717,6 +718,29 @@ sign_get(Expire_time, BucketName, Key, Config)
     Sig = base64:encode(erlcloud_util:sha_mac(Config#aws_config.secret_access_key, To_sign)),
     {Sig, Expires}.
 
+-spec sign_post(integer(), string(), string(), aws_config(), map()) -> {binary(), string()}.
+sign_post(Expire_time, BucketName, Key, Config, PreSignSetting)
+  when is_integer(Expire_time), is_list(BucketName), is_list(Key) ->
+    {Mega, Sec, _Micro} = os:timestamp(),
+    Datetime = (Mega * 1000000) + Sec,
+    Expires = integer_to_list(Expire_time + Datetime),
+    SecurityTokenToSign = case Config#aws_config.security_token of
+        undefined -> "";
+        SecurityToken -> "x-amz-security-token:" ++ SecurityToken ++ "\n"
+    end,
+    ContentTypeToSign = case maps:get(content_type, PreSignSetting) of
+        undefined -> "\n";
+        ContentType -> ContentType ++ "\n"
+    end,
+    AclToSign = case maps:get(acl, PreSignSetting) of
+        undefined -> "\n";
+        Acl -> "x-amz-acl:" ++ Acl ++ "\n"
+    end,
+    To_sign = lists:flatten(["PUT\n\n", ContentTypeToSign, Expires, "\n", AclToSign, "/", BucketName, "/", Key]),
+    Sig = base64:encode(erlcloud_util:sha_mac(Config#aws_config.secret_access_key, To_sign)),
+    {Sig, Expires}.
+
+
 -spec make_link(integer(), string(), string()) -> {integer(), string(), string()}.
 
 make_link(Expire_time, BucketName, Key) ->
@@ -768,6 +792,26 @@ make_get_url(Expire_time, BucketName, Key, Config) ->
      "&Signature=", erlcloud_http:url_encode(Sig),
      "&Expires=", Expires,
      SecurityTokenQS]).
+
+-spec make_put_url(integer(), string(), string(), map()) -> iolist().
+
+make_put_url(Expire_time, BucketName, Key, PreSignSetting) ->
+    make_put_url(Expire_time, BucketName, Key, default_config(), PreSignSetting).
+
+-spec make_put_url(integer(), string(), string(), aws_config(), map()) -> iolist().
+
+make_put_url(Expire_time, BucketName, Key, Config, PreSignSetting) ->
+    {Sig, Expires} = sign_post(Expire_time, BucketName, erlcloud_http:url_encode_loose(Key), Config, PreSignSetting),
+    SecurityTokenQS = case Config#aws_config.security_token of
+        undefined -> "";
+        SecurityToken -> "&x-amz-security-token=" ++ erlcloud_http:url_encode(SecurityToken)
+    end,
+    lists:flatten([get_object_url(BucketName, Key, Config),
+     "?AWSAccessKeyId=", erlcloud_http:url_encode(Config#aws_config.access_key_id),
+     "&Signature=", erlcloud_http:url_encode(Sig),
+     "&Expires=", Expires,
+     SecurityTokenQS]).
+
 
 -spec start_multipart(string(), string()) -> {ok, proplist()} | {error, any()}.
 start_multipart(BucketName, Key)
@@ -1123,8 +1167,8 @@ s3_request2_no_update(Config, Method, Host, Path, Subresource, Params, Body, Hea
 
 s3_result_fun(#aws_request{response_type = ok} = Request) ->
     Request;
-s3_result_fun(#aws_request{response_type = error, 
-                           error_type = aws, 
+s3_result_fun(#aws_request{response_type = error,
+                           error_type = aws,
                            response_status = Status} = Request) when
       Status >= 500 ->
     Request#aws_request{should_retry = true};
